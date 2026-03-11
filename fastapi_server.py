@@ -6,10 +6,18 @@ PRIVACY NOTE: This server NEVER receives raw power wattage data. Only evaluated
 context strings are transmitted to protect the elder's privacy.
 """
 
+import logging
 from datetime import datetime
 from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
+
+# --- Logging Setup ---
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+)
+logger = logging.getLogger("websocket")
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
@@ -82,20 +90,43 @@ class ConnectionManager:
     async def connect(self, websocket: WebSocket) -> None:
         await websocket.accept()
         self.active_connections.append(websocket)
+        logger.info(f"[WS CONNECT] New client connected. Total connections: {len(self.active_connections)}")
+        logger.debug(f"[WS CONNECT] Client info: {websocket.client}")
 
     def disconnect(self, websocket: WebSocket) -> None:
-        self.active_connections.remove(websocket)
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+            logger.info(f"[WS DISCONNECT] Client disconnected. Remaining connections: {len(self.active_connections)}")
+        else:
+            logger.warning(f"[WS DISCONNECT] Attempted to remove unknown websocket")
 
     async def broadcast(self, message: dict) -> None:
+        logger.debug(f"[WS BROADCAST] Starting broadcast to {len(self.active_connections)} clients")
+        logger.debug(f"[WS BROADCAST] Message type: {message.get('type', 'unknown')}")
+
+        if len(self.active_connections) == 0:
+            logger.warning("[WS BROADCAST] No active connections to broadcast to!")
+            return
+
         disconnected: list[WebSocket] = []
-        for connection in self.active_connections:
+        success_count = 0
+
+        for i, connection in enumerate(self.active_connections):
             try:
+                logger.debug(f"[WS BROADCAST] Sending to client {i+1}/{len(self.active_connections)}")
                 await connection.send_json(message)
-            except Exception:
+                success_count += 1
+                logger.debug(f"[WS BROADCAST] Successfully sent to client {i+1}")
+            except Exception as e:
+                logger.error(f"[WS BROADCAST] Failed to send to client {i+1}: {type(e).__name__}: {e}")
                 disconnected.append(connection)
+
         for connection in disconnected:
             if connection in self.active_connections:
                 self.active_connections.remove(connection)
+                logger.info(f"[WS BROADCAST] Removed dead connection. Remaining: {len(self.active_connections)}")
+
+        logger.info(f"[WS BROADCAST] Broadcast complete. Sent to {success_count}/{len(self.active_connections) + len(disconnected)} clients")
 
 
 ws_manager = ConnectionManager()
@@ -143,7 +174,10 @@ async def receive_alert(alert: CareAlert) -> AlertResponse:
         alerts_db[alert.device_id] = alerts_db[alert.device_id][-50:]
 
     # Broadcast to connected mobile apps
-    await ws_manager.broadcast({
+    logger.info(f"[ALERT] New alert received: {alert.anomaly_type} (severity {alert.severity}) from {alert.device_id}")
+    logger.debug(f"[ALERT] Alert details: {alert.model_dump()}")
+
+    broadcast_msg = {
         "type": "new_alert",
         "alert": {
             "device_id": alert.device_id,
@@ -153,7 +187,9 @@ async def receive_alert(alert: CareAlert) -> AlertResponse:
             "safe_context": alert.safe_context,
         },
         "alert_id": alert_counter,
-    })
+    }
+    logger.debug(f"[ALERT] Broadcasting message to WebSocket clients...")
+    await ws_manager.broadcast(broadcast_msg)
 
     return AlertResponse(
         status="received",
@@ -165,17 +201,30 @@ async def receive_alert(alert: CareAlert) -> AlertResponse:
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
     """WebSocket endpoint for mobile app to receive real-time alerts."""
+    logger.info(f"[WS ENDPOINT] New WebSocket connection request from {websocket.client}")
+
     await ws_manager.connect(websocket)
+
     try:
         total_alerts = sum(len(alerts) for alerts in alerts_db.values())
-        await websocket.send_json({
+        welcome_msg = {
             "type": "connection_established",
             "devices_tracked": len(alerts_db),
             "total_alerts": total_alerts,
-        })
+        }
+        logger.debug(f"[WS ENDPOINT] Sending welcome message: {welcome_msg}")
+        await websocket.send_json(welcome_msg)
+        logger.info(f"[WS ENDPOINT] Welcome message sent successfully")
+
         while True:
-            await websocket.receive_text()
+            data = await websocket.receive_text()
+            logger.debug(f"[WS ENDPOINT] Received message from client: {data[:100] if len(data) > 100 else data}")
+
     except WebSocketDisconnect:
+        logger.info(f"[WS ENDPOINT] Client disconnected gracefully")
+        ws_manager.disconnect(websocket)
+    except Exception as e:
+        logger.error(f"[WS ENDPOINT] Unexpected error: {type(e).__name__}: {e}")
         ws_manager.disconnect(websocket)
 
 
